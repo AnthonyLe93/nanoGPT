@@ -1,0 +1,128 @@
+# This workflow will install Python dependencies, run tests and lint with a single version of Python
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
+
+name: Ubuntu
+
+on:
+  push:
+    branches: [ "master", "dev"]
+  pull_request:
+    branches: [ "master" ]
+
+env:
+  DB_HOST: ${{secrets.DB_HOST}}
+  DB_PORT: ${{secrets.DB_PORT}}
+  DB_NAME: ${{secrets.DB_NAME}}
+  DB_USER: ${{secrets.DB_USER}}
+  DB_PASSWORD: ${{secrets.DB_PASSWORD}}
+  DB_HOST_LOCAL: ${{secrets.DB_HOST_LOCAL}}
+  DB_PORT_LOCAL: ${{secrets.DB_PORT_LOCAL}}
+  DB_NAME_LOCAL: ${{secrets.DB_NAME_LOCAL}}
+  DB_USER_LOCAL: ${{secrets.DB_USER_LOCAL}}
+  DB_PASSWORD_LOCAL: ${{secrets.DB_PASSWORD_LOCAL}}
+  WHISKY_SELENIUM_TEST_REMOTE: ${{vars.WHISKY_SELENIUM_TEST_REMOTE}}
+  DATABASE: local
+  FLASK_ENV: development
+  FLASK_APP: whiskyapp
+  USERNAME_TEST: ${{secrets.USERNAME_TEST}}
+  PASSWORD_TEST: ${{secrets.PASSWORD_TEST}}
+  CI: ${{vars.CI}}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres
+        env:
+          POSTGRES_PASSWORD: ${{secrets.DB_PASSWORD_LOCAL}}
+          POSTGRES_DB: ${{secrets.DB_NAME_LOCAL}}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+    - uses: actions/checkout@v3
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v3
+      with:
+        python-version: "3.10"
+    - uses: actions/cache@v2
+      with:
+        path: ~/.cache/pip
+        key: ${{ hashFiles('setup.py') }}-${{ hashFiles('requirements.txt') }}
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install --upgrade wheel
+        pip install flake8 pytest mypy
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+    - name: Lint with flake8
+      run: |
+        # stop the build if there are Python syntax errors or undefined names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+    - name: Type checking with mypy
+      continue-on-error: true
+      run: mypy -p src
+
+    - name: Test database connection
+      run: psql postgres://postgres:postgres@localhost:5432/postgres -c 'SELECT 1;'
+
+    - name: Initialised database
+      env:
+        PGPASSWORD: ${{secrets.DB_PASSWORD_LOCAL}}
+      run: |
+        psql -U postgres -d dev -h localhost -f ./postgres/schema.sql -f ./postgres/schemaTest.sql
+        psql -U postgres -d dev -h localhost -f ./postgres/data.sql -f ./postgres/dataTest.sql
+    - name: Run unit-tests on local Postgres database
+      run: |
+        cd tests/
+        pytest -v -m PostgresService
+    - name: Run unit-tests on remote Postgres database
+      env:
+        DATABASE: remote
+      run: |
+        cd tests/
+        pytest -v -m PostgresService
+    - name: Test with pytest except selenium and db tests
+      run: |
+        pytest -v -m "not (webtest or PostgresService or app or slow)"
+    - name: Run selenium unit-tests
+      continue-on-error: true
+      run: |
+        # Run Selenium tests
+        pytest -v -m webtest -n 6
+    - name: Run slow selenium unit-tests
+      continue-on-error: true
+      run: |
+        # Run slow Selenium tests
+        pytest -v -m slow
+    - name: Test whisky app
+      run: |
+        pytest -v -m app
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [ build ]
+    if: github.ref == 'refs/heads/dev'
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - name: Create CodeDeploy Deployment
+        id: deploy
+        run: |
+          aws deploy create-deployment \
+            --application-name whiskyapp_test \
+            --deployment-group-name development_group \
+            --deployment-config-name CodeDeployDefault.AllAtOnce \
+            --github-location repository=${{ github.repository }},commitId=${{ github.sha }} \
+            --file-exists-behavior OVERWRITE \
+            --description "Deploying whisky app to EC2" \
+
